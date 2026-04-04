@@ -4,9 +4,10 @@
   "description": "Reverse proxy and security middleware for ProxyArmor",
   "main": "src/proxy.js",
   "scripts": {
+    "start": "node src/proxy.js",
     "proxy": "node src/proxy.js",
     "mock": "node mockBackend.js",
-    "server": "node src/server.js"
+    "server": "node src/proxy.js"
   },
   "keywords": [
     "proxy",
