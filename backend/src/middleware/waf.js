@@ -1,79 +1,101 @@
-const blacklist = new Set();
-const violations = new Map();
+const SQL_INJECTION_PATTERNS = [
+  { expression: /\bselect\b/i, reason: 'SQL injection detected (SELECT keyword)' },
+  { expression: /\bdrop\b/i, reason: 'SQL injection detected (DROP keyword)' },
+  { expression: /\bor\s+1=1\b/i, reason: 'SQL injection detected (OR 1=1 pattern)' }
+];
+
+const XSS_PATTERNS = [
+  { expression: /<script\b/i, reason: 'XSS detected (<script> tag)' }
+];
 
 const MAX_VIOLATIONS = 3;
-const WINDOW_TIME = 5 * 60 * 1000;
+const WINDOW_MS = 5 * 60 * 1000;
 
-function detectSQLInjection(url) {
-  const patterns = [/select/i, /drop/i, /insert/i, /delete/i, /or 1=1/i];
-  return patterns.some((pattern) => pattern.test(url));
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(String(value).replace(/\+/g, ' '));
+  } catch {
+    return String(value);
+  }
 }
 
-function detectXSS(url) {
-  const patterns = [/<script>/i, /<\/script>/i, /onerror/i, /onload/i];
-  return patterns.some((pattern) => pattern.test(url));
-}
+function createWaf({ onBlacklist = () => {} } = {}) {
+  const violationsByIp = new Map();
+  let blacklistedIPs = new Set();
 
-function recordViolation(ip) {
-  const now = Date.now();
-
-  if (!violations.has(ip)) {
-    violations.set(ip, { count: 1, firstTime: now });
-    return false;
+  function updateConfig(config = {}) {
+    blacklistedIPs = new Set(Array.isArray(config.blacklistedIPs) ? config.blacklistedIPs : []);
   }
 
-  const record = violations.get(ip);
+  function recordViolation(ip, now = Date.now()) {
+    const timestamps = violationsByIp.get(ip) || [];
 
-  if (now - record.firstTime > WINDOW_TIME) {
-    violations.set(ip, { count: 1, firstTime: now });
-    return false;
-  }
+    while (timestamps.length && now - timestamps[0] >= WINDOW_MS) {
+      timestamps.shift();
+    }
 
-  record.count += 1;
+    timestamps.push(now);
+    violationsByIp.set(ip, timestamps);
 
-  if (record.count >= MAX_VIOLATIONS) {
-    blacklist.add(ip);
-    console.log(`🔥 AUTO-BLACKLISTED IP: ${ip}`);
-    return true;
-  }
+    if (timestamps.length >= MAX_VIOLATIONS) {
+      if (!blacklistedIPs.has(ip)) {
+        blacklistedIPs.add(ip);
+        onBlacklist(ip);
+      }
 
-  return false;
-}
+      return {
+        blacklisted: true
+      };
+    }
 
-function waf(req) {
-  const ip = req.socket.remoteAddress;
-  const url = req.url;
-
-  if (blacklist.has(ip)) {
     return {
-      allowed: false,
-      reason: 'IP is blacklisted'
+      blacklisted: false
     };
   }
 
-  if (detectSQLInjection(url)) {
-    const escalated = recordViolation(ip);
+  function detectAttack(scanText) {
+    const patterns = [...SQL_INJECTION_PATTERNS, ...XSS_PATTERNS];
+    return patterns.find((pattern) => pattern.expression.test(scanText)) || null;
+  }
+
+  function inspect({ ip, pathname, search = '', headers = {}, bodyText = '' }) {
+    if (blacklistedIPs.has(ip)) {
+      return {
+        allowed: false,
+        reason: 'IP is permanently blacklisted'
+      };
+    }
+
+    const headerSnapshot = [
+      headers['user-agent'],
+      headers['referer'],
+      headers['x-forwarded-for']
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    const rawPayload = [pathname, search, bodyText, headerSnapshot].filter(Boolean).join('\n');
+    const scanText = `${rawPayload}\n${safeDecode(rawPayload)}`;
+    const detectedAttack = detectAttack(scanText);
+
+    if (!detectedAttack) {
+      return { allowed: true };
+    }
+
+    const violation = recordViolation(ip);
 
     return {
       allowed: false,
-      reason: escalated
-        ? 'IP auto-blacklisted due to repeated SQL attacks'
-        : 'SQL Injection detected'
+      reason: violation.blacklisted
+        ? 'IP permanently blacklisted after 3 malicious requests in 5 minutes'
+        : detectedAttack.reason
     };
   }
 
-  if (detectXSS(url)) {
-    const escalated = recordViolation(ip);
-
-    return {
-      allowed: false,
-      reason: escalated
-        ? 'IP auto-blacklisted due to repeated XSS attacks'
-        : 'XSS attack detected'
-    };
-  }
-
-  return { allowed: true };
+  return {
+    inspect,
+    updateConfig
+  };
 }
 
-module.exports = waf;
+module.exports = createWaf;
