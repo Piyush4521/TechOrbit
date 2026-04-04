@@ -1,0 +1,19 @@
+{
+  "name": "proxyarmor-backend",
+  "version": "1.0.0",
+  "description": "Reverse proxy and security middleware for ProxyArmor",
+  "main": "src/proxy.js",
+  "scripts": {
+    "proxy": "node src/proxy.js",
+    "mock": "node mockBackend.js",
+    "server": "node src/server.js"
+  },
+  "keywords": [
+    "proxy",
+    "security",
+    "dashboard",
+    "waf"
+  ],
+  "author": "Piyush Rohidas Sonawane",
+  "license": "ISC"
+}
