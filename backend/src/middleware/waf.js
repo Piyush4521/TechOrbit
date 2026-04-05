@@ -1,11 +1,31 @@
 const SQL_INJECTION_PATTERNS = [
-  { expression: /\bselect\b/i, reason: 'SQL injection detected (SELECT keyword)' },
-  { expression: /\bdrop\b/i, reason: 'SQL injection detected (DROP keyword)' },
-  { expression: /\bor\s+1=1\b/i, reason: 'SQL injection detected (OR 1=1 pattern)' }
+  {
+    expression: /\bselect\b/i,
+    reason: 'SQL injection detected (SELECT keyword)',
+    category: 'SQL Injection',
+    signal: 'SELECT keyword'
+  },
+  {
+    expression: /\bdrop\b/i,
+    reason: 'SQL injection detected (DROP keyword)',
+    category: 'SQL Injection',
+    signal: 'DROP keyword'
+  },
+  {
+    expression: /\bor\s+1=1\b/i,
+    reason: 'SQL injection detected (OR 1=1 pattern)',
+    category: 'SQL Injection',
+    signal: 'OR 1=1 pattern'
+  }
 ];
 
 const XSS_PATTERNS = [
-  { expression: /<script\b/i, reason: 'XSS detected (<script> tag)' }
+  {
+    expression: /<script\b/i,
+    reason: 'XSS detected (<script> tag)',
+    category: 'Cross-Site Scripting',
+    signal: '<script> tag'
+  }
 ];
 
 const MAX_VIOLATIONS = 3;
@@ -44,12 +64,14 @@ function createWaf({ onBlacklist = () => {} } = {}) {
       }
 
       return {
-        blacklisted: true
+        blacklisted: true,
+        violationCount: timestamps.length
       };
     }
 
     return {
-      blacklisted: false
+      blacklisted: false,
+      violationCount: timestamps.length
     };
   }
 
@@ -62,7 +84,13 @@ function createWaf({ onBlacklist = () => {} } = {}) {
     if (blacklistedIPs.has(ip)) {
       return {
         allowed: false,
-        reason: 'IP is permanently blacklisted'
+        reason: 'IP is permanently blacklisted',
+        category: 'Blacklist',
+        signal: 'Existing blacklist match',
+        blacklisted: true,
+        violationCount: MAX_VIOLATIONS,
+        windowMs: WINDOW_MS,
+        maxViolations: MAX_VIOLATIONS
       };
     }
 
@@ -88,7 +116,13 @@ function createWaf({ onBlacklist = () => {} } = {}) {
       allowed: false,
       reason: violation.blacklisted
         ? 'IP permanently blacklisted after 3 malicious requests in 5 minutes'
-        : detectedAttack.reason
+        : detectedAttack.reason,
+      category: violation.blacklisted ? 'Blacklist' : detectedAttack.category,
+      signal: violation.blacklisted ? 'Automatic blacklist escalation' : detectedAttack.signal,
+      blacklisted: violation.blacklisted,
+      violationCount: violation.violationCount,
+      windowMs: WINDOW_MS,
+      maxViolations: MAX_VIOLATIONS
     };
   }
 

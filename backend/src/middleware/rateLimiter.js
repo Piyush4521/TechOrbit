@@ -74,7 +74,13 @@ function createRateLimiter() {
         allowed: false,
         retryAfterMs: matchedRule.windowMs - (now - timestamps[0]),
         effectiveLimit,
-        score: reputationScore
+        configuredLimit: matchedRule.limit,
+        windowMs: matchedRule.windowMs,
+        score: reputationScore,
+        rule: {
+          method: matchedRule.method,
+          path: matchedRule.path
+        }
       };
     }
 
@@ -84,7 +90,13 @@ function createRateLimiter() {
     return {
       allowed: true,
       effectiveLimit,
-      score: reputationScore
+      configuredLimit: matchedRule.limit,
+      windowMs: matchedRule.windowMs,
+      score: reputationScore,
+      rule: {
+        method: matchedRule.method,
+        path: matchedRule.path
+      }
     };
   }
 

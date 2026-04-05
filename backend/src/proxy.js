@@ -12,27 +12,142 @@ const EVENTS_PATH = '/events';
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_CONCURRENT = 50;
 const MAX_QUEUE_LENGTH = 200;
+const BODY_PREVIEW_LIMIT = 600;
+const SNAPSHOT_HEADER_KEYS = [
+  'content-type',
+  'content-length',
+  'user-agent',
+  'referer',
+  'x-forwarded-for'
+];
 
 const sseClients = new Set();
 const rateLimiter = createRateLimiter();
 const requestQueue = [];
 let processing = 0;
+let nextEventId = 1;
 
-function broadcast(message) {
+function broadcast(payload) {
+  const serialized = JSON.stringify(payload);
+
   for (const client of sseClients) {
     if (client.writableEnded || client.destroyed) {
       sseClients.delete(client);
       continue;
     }
 
-    client.write(`data: ${message}\n\n`);
+    client.write(`data: ${serialized}\n\n`);
   }
 }
 
-function logEvent(type, message) {
-  const line = `[${new Date().toISOString()}] ${type}: ${message}`;
+function normalizeHeaderValue(value) {
+  if (Array.isArray(value)) {
+    return value.join(', ');
+  }
+
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  return String(value);
+}
+
+function serializeHeaders(headers = {}) {
+  return SNAPSHOT_HEADER_KEYS.reduce((snapshot, key) => {
+    const value = normalizeHeaderValue(headers[key]);
+
+    if (value) {
+      snapshot[key] = value;
+    }
+
+    return snapshot;
+  }, {});
+}
+
+function serializeQueryParams(searchParams) {
+  return Array.from(searchParams.entries()).map(([key, value]) => ({ key, value }));
+}
+
+function truncateText(value, limit = BODY_PREVIEW_LIMIT) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.length <= limit) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, limit)}...`;
+}
+
+function sanitizeDetails(details = {}) {
+  return Object.entries(details).reduce((clean, [key, value]) => {
+    if (value === undefined || value === null || value === '') {
+      return clean;
+    }
+
+    if (Array.isArray(value)) {
+      if (value.length > 0) {
+        clean[key] = value;
+      }
+
+      return clean;
+    }
+
+    if (typeof value === 'object') {
+      if (Object.keys(value).length > 0) {
+        clean[key] = value;
+      }
+
+      return clean;
+    }
+
+    clean[key] = value;
+    return clean;
+  }, {});
+}
+
+function buildRequestSnapshot({ req, requestUrl, pathname, clientIp, bodyBuffer = null }) {
+  const snapshot = {
+    method: (req.method || 'GET').toUpperCase(),
+    path: pathname,
+    rawPath: `${pathname}${requestUrl.search}`,
+    search: requestUrl.search,
+    queryParams: serializeQueryParams(requestUrl.searchParams),
+    ip: clientIp,
+    headers: serializeHeaders(req.headers)
+  };
+
+  if (bodyBuffer) {
+    const bodyText = bodyBuffer.length ? bodyBuffer.toString('utf8') : '';
+    snapshot.bodyBytes = bodyBuffer.length;
+    snapshot.bodyPreview = truncateText(bodyText);
+  }
+
+  return sanitizeDetails(snapshot);
+}
+
+function logEvent(type, message, details = {}) {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] ${type}: ${message}`;
+  const payload = {
+    id: nextEventId++,
+    timestamp,
+    type,
+    message,
+    line,
+    details: sanitizeDetails(details)
+  };
+
   console.log(line);
-  broadcast(line);
+  broadcast(payload);
+  return payload;
 }
 
 const configManager = createConfigManager({
@@ -42,7 +157,11 @@ const configManager = createConfigManager({
 const waf = createWaf({
   onBlacklist: (ip) => {
     configManager.persistBlacklistedIp(ip);
-    logEvent('Blacklisted', `${ip} permanently blacklisted`);
+    logEvent('Blacklisted', `${ip} permanently blacklisted`, {
+      ip,
+      category: 'Blacklist',
+      stage: 'waf'
+    });
   }
 });
 
@@ -173,8 +292,18 @@ function dequeueNextRequest() {
 }
 
 function queueRequest(req, res) {
+  const clientIp = normalizeClientIp(req.socket.remoteAddress);
+
   if (requestQueue.length >= MAX_QUEUE_LENGTH) {
-    logEvent('Dropped', `${req.method} ${req.url || '/'} rejected because the queue is full`);
+    logEvent('Dropped', `${req.method} ${req.url || '/'} rejected because the queue is full`, {
+      method: (req.method || 'GET').toUpperCase(),
+      path: req.url || '/',
+      ip: clientIp,
+      queueLength: requestQueue.length,
+      maxQueueLength: MAX_QUEUE_LENGTH,
+      stage: 'queue',
+      statusCode: 503
+    });
     sendJson(res, 503, {
       error: 'Service Unavailable',
       detail: 'ProxyArmor is overloaded. Please retry shortly.'
@@ -198,7 +327,14 @@ function queueRequest(req, res) {
   res.once('close', cancelQueuedRequest);
 
   requestQueue.push(entry);
-  logEvent('Queued', `${req.method} ${req.url || '/'} queued (${requestQueue.length} waiting)`);
+  logEvent('Queued', `${req.method} ${req.url || '/'} queued (${requestQueue.length} waiting)`, {
+    method: (req.method || 'GET').toUpperCase(),
+    path: req.url || '/',
+    ip: clientIp,
+    queueLength: requestQueue.length,
+    maxQueueLength: MAX_QUEUE_LENGTH,
+    stage: 'queue'
+  });
 }
 
 async function handleRequest(req, res) {
@@ -213,15 +349,27 @@ async function handleRequest(req, res) {
 
   const clientIp = normalizeClientIp(req.socket.remoteAddress);
   const pathname = normalizePath(requestUrl.pathname);
+  const requestSnapshot = buildRequestSnapshot({
+    req,
+    requestUrl,
+    pathname,
+    clientIp
+  });
 
-  logEvent('Incoming', `${req.method} ${pathname}${requestUrl.search} from ${clientIp}`);
+  logEvent('Incoming', `${req.method} ${pathname}${requestUrl.search} from ${clientIp}`, requestSnapshot);
 
   let bodyBuffer;
 
   try {
     bodyBuffer = await readRequestBody(req);
   } catch (error) {
-    logEvent('Blocked', `${req.method} ${pathname} rejected before proxying: ${error.message}`);
+    logEvent('Blocked', `${req.method} ${pathname} rejected before proxying: ${error.message}`, {
+      ...requestSnapshot,
+      reason: error.message,
+      category: 'Request Validation',
+      stage: 'pre-proxy',
+      statusCode: error.statusCode || 400
+    });
     sendJson(res, error.statusCode || 400, {
       error: 'Request Rejected',
       detail: error.message
@@ -230,6 +378,13 @@ async function handleRequest(req, res) {
   }
 
   const bodyText = bodyBuffer.length ? bodyBuffer.toString('utf8') : '';
+  const fullRequestSnapshot = buildRequestSnapshot({
+    req,
+    requestUrl,
+    pathname,
+    clientIp,
+    bodyBuffer
+  });
 
   const wafResult = waf.inspect({
     ip: clientIp,
@@ -243,7 +398,20 @@ async function handleRequest(req, res) {
     const nextScore = increaseScore(clientIp, 2);
     logEvent(
       'Blocked',
-      `${wafResult.reason} from ${clientIp} on ${req.method} ${pathname} (reputation ${nextScore})`
+      `${wafResult.reason} from ${clientIp} on ${req.method} ${pathname} (reputation ${nextScore})`,
+      {
+        ...fullRequestSnapshot,
+        reason: wafResult.reason,
+        category: wafResult.category || 'Threat Detected',
+        signal: wafResult.signal,
+        reputation: nextScore,
+        blacklisted: Boolean(wafResult.blacklisted),
+        violationCount: wafResult.violationCount,
+        maxViolations: wafResult.maxViolations,
+        violationWindowMs: wafResult.windowMs,
+        stage: 'waf',
+        statusCode: 403
+      }
     );
     sendJson(res, 403, {
       error: 'Forbidden',
@@ -258,7 +426,19 @@ async function handleRequest(req, res) {
     const nextScore = increaseScore(clientIp, 1);
     logEvent(
       'RateLimited',
-      `${clientIp} exceeded ${req.method} ${pathname} at limit ${rateLimitResult.effectiveLimit} (reputation ${nextScore})`
+      `${clientIp} exceeded ${req.method} ${pathname} at limit ${rateLimitResult.effectiveLimit} (reputation ${nextScore})`,
+      {
+        ...fullRequestSnapshot,
+        category: 'Rate Limit',
+        reputation: nextScore,
+        effectiveLimit: rateLimitResult.effectiveLimit,
+        configuredLimit: rateLimitResult.configuredLimit,
+        retryAfterMs: rateLimitResult.retryAfterMs,
+        windowMs: rateLimitResult.windowMs,
+        matchedRule: rateLimitResult.rule,
+        stage: 'rate-limiter',
+        statusCode: 429
+      }
     );
     sendJson(res, 429, {
       error: 'Too Many Requests',
@@ -273,7 +453,8 @@ async function handleRequest(req, res) {
     res,
     bodyBuffer,
     requestUrl,
-    clientIp
+    clientIp,
+    requestSnapshot: fullRequestSnapshot
   });
 }
 
@@ -295,7 +476,13 @@ function processRequest(req, res) {
   res.once('close', release);
 
   handleRequest(req, res).catch((error) => {
-    logEvent('ProxyError', `${req.method} ${req.url || '/'} failed before proxying: ${error.message}`);
+    logEvent('ProxyError', `${req.method} ${req.url || '/'} failed before proxying: ${error.message}`, {
+      method: (req.method || 'GET').toUpperCase(),
+      path: req.url || '/',
+      reason: error.message,
+      stage: 'pre-proxy',
+      statusCode: 500
+    });
 
     if (!res.headersSent) {
       sendJson(res, 500, {
@@ -311,7 +498,7 @@ function processRequest(req, res) {
   });
 }
 
-function forwardRequest({ req, res, bodyBuffer, requestUrl, clientIp }) {
+function forwardRequest({ req, res, bodyBuffer, requestUrl, clientIp, requestSnapshot }) {
   const { backendUrl } = configManager.getConfig();
   const backend = new URL(backendUrl);
   const targetUrl = new URL(req.url || '/', backend);
@@ -349,7 +536,16 @@ function forwardRequest({ req, res, bodyBuffer, requestUrl, clientIp }) {
 
       logEvent(
         'Allowed',
-        `${req.method} ${requestUrl.pathname} -> ${proxyResponse.statusCode || 502} for ${clientIp}`
+        `${req.method} ${requestUrl.pathname} -> ${proxyResponse.statusCode || 502} for ${clientIp}`,
+        {
+          ...requestSnapshot,
+          backendUrl,
+          targetOrigin: targetUrl.origin,
+          targetPath: `${targetUrl.pathname}${targetUrl.search}`,
+          upstreamStatus: proxyResponse.statusCode || 502,
+          stage: 'proxy',
+          statusCode: proxyResponse.statusCode || 502
+        }
       );
     }
   );
@@ -359,7 +555,15 @@ function forwardRequest({ req, res, bodyBuffer, requestUrl, clientIp }) {
   });
 
   proxyRequest.on('error', (error) => {
-    logEvent('ProxyError', `${req.method} ${requestUrl.pathname} failed: ${error.message}`);
+    logEvent('ProxyError', `${req.method} ${requestUrl.pathname} failed: ${error.message}`, {
+      ...requestSnapshot,
+      reason: error.message,
+      backendUrl,
+      targetOrigin: targetUrl.origin,
+      targetPath: `${targetUrl.pathname}${targetUrl.search}`,
+      stage: 'proxy',
+      statusCode: 502
+    });
 
     if (!res.headersSent) {
       sendJson(res, 502, {
