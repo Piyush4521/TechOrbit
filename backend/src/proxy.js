@@ -2,12 +2,19 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 
-const createRequestPipeline = require('../core/requestPipeline');
+const createRequestPipeline = require('./core/requestPipeline');
 const { createConfigManager, normalizePath } = require('./configManager');
 const createRateLimiter = require('./middleware/rateLimiter');
 const { increaseScore } = require('./middleware/reputation');
 const createWaf = require('./middleware/waf');
-const { getMetrics } = require('../services/metrics');
+
+const {
+  getMetrics,
+  recordRequest,
+  recordAllowed,
+  recordBlocked,
+  recordRateLimited
+} = require('./services/metrics');
 
 const PROXY_PORT = 9090;
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -18,10 +25,22 @@ const rateLimiter = createRateLimiter();
 const requestQueue = [];
 let processing = 0;
 
+const sseClients = new Set();
+
 function logEvent(type, message, details = {}) {
   const timestamp = new Date().toISOString();
   const line = `[${timestamp}] ${type}: ${message}`;
   console.log(line);
+
+  const payload = `data: ${JSON.stringify({
+    id: Date.now(),
+    type,
+    message,
+    details
+  })}\n\n`;
+
+  sseClients.forEach(client => client.write(payload));
+
   return { timestamp, type, message, details };
 }
 
@@ -85,6 +104,8 @@ function forwardRequest({ req, res, bodyBuffer }) {
 
   const transport = targetUrl.protocol === 'https:' ? https : http;
 
+  console.log("Forwarding to:", targetUrl.href);
+
   const proxyReq = transport.request(
     {
       hostname: targetUrl.hostname,
@@ -98,11 +119,17 @@ function forwardRequest({ req, res, bodyBuffer }) {
       proxyRes.pipe(res);
 
       logEvent('Allowed', `${req.method} ${req.url}`);
+
+      recordAllowed();
     }
   );
 
-  proxyReq.on('error', () => {
-    sendJson(res, 502, { error: 'Bad Gateway' });
+  proxyReq.on('error', (err) => {
+    console.error("Proxy Error:", err.message);
+
+    recordBlocked();
+
+    sendJson(res, 502, { error: 'Bad Gateway', detail: err.message });
   });
 
   if (bodyBuffer.length > 0) {
@@ -126,6 +153,8 @@ const handleRequest = createRequestPipeline({
 });
 
 function processRequest(req, res) {
+  recordRequest();
+
   processing++;
 
   res.on('finish', () => {
@@ -156,6 +185,24 @@ const server = http.createServer((req, res) => {
   setCorsHeaders(res);
 
   
+  if (req.url === '/events') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+
+    res.write('data: connected\n\n');
+
+    sseClients.add(res);
+
+    req.on('close', () => {
+      sseClients.delete(res);
+    });
+
+    return;
+  }
+
   if (req.url === '/metrics') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(getMetrics(), null, 2));

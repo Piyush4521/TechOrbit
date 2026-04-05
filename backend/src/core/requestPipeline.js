@@ -1,7 +1,7 @@
 const { isBanned } = require('../middleware/reputation');
 const metrics = require('../services/metrics');
 
-async function createRequestPipeline({
+function createRequestPipeline({
   waf,
   rateLimiter,
   increaseScore,

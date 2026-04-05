@@ -103,8 +103,16 @@ const CONSUMED_DETAIL_KEYS = new Set([
 ])
 
 function makeFallbackId() {
-  return `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-}
+  useEffect(() => {
+  const interval = setInterval(async () => {
+    const res = await fetch('http://localhost:9090/metrics')
+    const data = await res.json()
+
+    setRpsData(prev => [...prev, data.requestsPerSecond].slice(-20))
+  }, 1000)
+
+  return () => clearInterval(interval)
+}, [])}
 
 function normalizeEventRecord(candidate) {
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
@@ -263,12 +271,13 @@ function useHashRoute() {
   return route
 }
 
+// MODIFIED: Updated to match the semantic CSS variable names
 function getTone(type) {
   switch (type) {
     case 'Allowed':
     case 'Live':
     case 'Startup':
-      return 'good'
+      return 'success'
     case 'Blocked':
     case 'Blacklisted':
     case 'ProxyError':
@@ -277,9 +286,9 @@ function getTone(type) {
     case 'RateLimited':
     case 'Config':
     case 'Queued':
-      return 'warn'
+      return 'warning'
     default:
-      return 'neutral'
+      return 'info'
   }
 }
 
@@ -436,7 +445,8 @@ function DashboardView({ status, stats, events, lastEvent }) {
             single incident for the full request and protection context.
           </p>
         </div>
-        <div className={`status-pill status-${status.toLowerCase()}`}>
+        {/* MODIFIED: Safely toggles status-reconnecting class */}
+        <div className={`status-pill ${status === 'Reconnecting' ? 'status-reconnecting' : ''}`}>
           <span className="status-dot" />
           {status}
         </div>

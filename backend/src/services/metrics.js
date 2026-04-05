@@ -9,9 +9,12 @@ const metrics = {
 };
 
 let requestCountWindow = 0;
+let lastWindowTime = Date.now();
+
 setInterval(() => {
   metrics.requestsPerSecond = requestCountWindow;
   requestCountWindow = 0;
+  lastWindowTime = Date.now();
 }, 1000);
 
 function recordRequest() {
@@ -20,28 +23,58 @@ function recordRequest() {
   requestCountWindow++;
 }
 
+function safeDecrementActive() {
+  if (metrics.activeRequests > 0) {
+    metrics.activeRequests--;
+  }
+}
+
 function recordAllowed() {
   metrics.allowed++;
-  metrics.activeRequests--;
+  safeDecrementActive();
 }
 
 function recordBlocked() {
   metrics.blocked++;
-  metrics.activeRequests--;
+  safeDecrementActive();
 }
 
 function recordRateLimited() {
   metrics.rateLimited++;
-  metrics.activeRequests--;
+  safeDecrementActive();
 }
 
 function recordBanned() {
   metrics.banned++;
-  metrics.activeRequests--;
+  safeDecrementActive();
+}
+
+function normalizeMetrics() {
+  const totalHandled =
+    metrics.allowed +
+    metrics.blocked +
+    metrics.rateLimited +
+    metrics.banned;
+
+  if (totalHandled > metrics.totalRequests) {
+    metrics.totalRequests = totalHandled;
+  }
 }
 
 function getMetrics() {
-  return { ...metrics };
+  normalizeMetrics();
+
+  return {
+    ...metrics,
+    successRate:
+      metrics.totalRequests > 0
+        ? ((metrics.allowed / metrics.totalRequests) * 100).toFixed(2)
+        : "0.00",
+    blockRate:
+      metrics.totalRequests > 0
+        ? (((metrics.blocked + metrics.rateLimited) / metrics.totalRequests) * 100).toFixed(2)
+        : "0.00"
+  };
 }
 
 module.exports = {
