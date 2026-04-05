@@ -1,4 +1,5 @@
 const { normalizePath } = require('../configManager');
+const { getScore } = require('./reputation');
 
 function getRulePriority(rule) {
   let score = 0;
@@ -18,6 +19,18 @@ function pruneTimestamps(timestamps, windowMs, now) {
   while (timestamps.length && now - timestamps[0] >= windowMs) {
     timestamps.shift();
   }
+}
+
+function getEffectiveLimit(limit, score) {
+  if (score >= 3) {
+    return Math.max(1, Math.floor(limit * 0.3));
+  }
+
+  if (score >= 1) {
+    return Math.max(1, Math.floor(limit * 0.6));
+  }
+
+  return limit;
 }
 
 function createRateLimiter() {
@@ -51,13 +64,17 @@ function createRateLimiter() {
 
     const bucketKey = `${ip}:${normalizedMethod}:${normalizedPath}`;
     const timestamps = buckets.get(bucketKey) || [];
+    const reputationScore = getScore(ip);
+    const effectiveLimit = getEffectiveLimit(matchedRule.limit, reputationScore);
 
     pruneTimestamps(timestamps, matchedRule.windowMs, now);
 
-    if (timestamps.length >= matchedRule.limit) {
+    if (timestamps.length >= effectiveLimit) {
       return {
         allowed: false,
-        retryAfterMs: matchedRule.windowMs - (now - timestamps[0])
+        retryAfterMs: matchedRule.windowMs - (now - timestamps[0]),
+        effectiveLimit,
+        score: reputationScore
       };
     }
 
@@ -65,7 +82,9 @@ function createRateLimiter() {
     buckets.set(bucketKey, timestamps);
 
     return {
-      allowed: true
+      allowed: true,
+      effectiveLimit,
+      score: reputationScore
     };
   }
 

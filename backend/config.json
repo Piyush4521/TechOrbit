@@ -16,7 +16,7 @@
     {
       "method": "POST",
       "path": "/login",
-      "limit": 5,
+      "limit": 2,
       "window": 60
     },
     {

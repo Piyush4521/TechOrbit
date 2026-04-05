@@ -4,14 +4,19 @@ const { URL } = require('url');
 
 const { createConfigManager, normalizePath } = require('./configManager');
 const createRateLimiter = require('./middleware/rateLimiter');
+const { increaseScore } = require('./middleware/reputation');
 const createWaf = require('./middleware/waf');
 
 const PROXY_PORT = 9090;
 const EVENTS_PATH = '/events';
 const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_CONCURRENT = 50;
+const MAX_QUEUE_LENGTH = 200;
 
 const sseClients = new Set();
 const rateLimiter = createRateLimiter();
+const requestQueue = [];
+let processing = 0;
 
 function broadcast(message) {
   for (const client of sseClients) {
@@ -130,6 +135,8 @@ function readRequestBody(req) {
         reject(error);
       }
     });
+
+    req.resume();
   });
 }
 
@@ -142,6 +149,166 @@ function sendJson(res, statusCode, payload) {
 function applyConfig(config) {
   rateLimiter.updateConfig(config.rateLimits);
   waf.updateConfig(config);
+}
+
+function finishQueuedRequest(entry) {
+  if (!entry || entry.completed) {
+    return;
+  }
+
+  entry.completed = true;
+}
+
+function dequeueNextRequest() {
+  while (processing < MAX_CONCURRENT && requestQueue.length > 0) {
+    const next = requestQueue.shift();
+
+    if (!next || next.completed || next.req.destroyed || next.res.destroyed || next.res.writableEnded) {
+      continue;
+    }
+
+    next.completed = true;
+    processRequest(next.req, next.res);
+  }
+}
+
+function queueRequest(req, res) {
+  if (requestQueue.length >= MAX_QUEUE_LENGTH) {
+    logEvent('Dropped', `${req.method} ${req.url || '/'} rejected because the queue is full`);
+    sendJson(res, 503, {
+      error: 'Service Unavailable',
+      detail: 'ProxyArmor is overloaded. Please retry shortly.'
+    });
+    return;
+  }
+
+  const entry = {
+    req,
+    res,
+    completed: false
+  };
+
+  const cancelQueuedRequest = () => {
+    finishQueuedRequest(entry);
+  };
+
+  req.pause();
+  req.once('aborted', cancelQueuedRequest);
+  req.once('close', cancelQueuedRequest);
+  res.once('close', cancelQueuedRequest);
+
+  requestQueue.push(entry);
+  logEvent('Queued', `${req.method} ${req.url || '/'} queued (${requestQueue.length} waiting)`);
+}
+
+async function handleRequest(req, res) {
+  let requestUrl;
+
+  try {
+    requestUrl = new URL(req.url || '/', 'http://proxyarmor.local');
+  } catch {
+    sendJson(res, 400, { error: 'Bad Request', detail: 'Invalid request URL' });
+    return;
+  }
+
+  const clientIp = normalizeClientIp(req.socket.remoteAddress);
+  const pathname = normalizePath(requestUrl.pathname);
+
+  logEvent('Incoming', `${req.method} ${pathname}${requestUrl.search} from ${clientIp}`);
+
+  let bodyBuffer;
+
+  try {
+    bodyBuffer = await readRequestBody(req);
+  } catch (error) {
+    logEvent('Blocked', `${req.method} ${pathname} rejected before proxying: ${error.message}`);
+    sendJson(res, error.statusCode || 400, {
+      error: 'Request Rejected',
+      detail: error.message
+    });
+    return;
+  }
+
+  const bodyText = bodyBuffer.length ? bodyBuffer.toString('utf8') : '';
+
+  const wafResult = waf.inspect({
+    ip: clientIp,
+    pathname,
+    search: requestUrl.search,
+    headers: req.headers,
+    bodyText
+  });
+
+  if (!wafResult.allowed) {
+    const nextScore = increaseScore(clientIp, 2);
+    logEvent(
+      'Blocked',
+      `${wafResult.reason} from ${clientIp} on ${req.method} ${pathname} (reputation ${nextScore})`
+    );
+    sendJson(res, 403, {
+      error: 'Forbidden',
+      detail: wafResult.reason
+    });
+    return;
+  }
+
+  const rateLimitResult = rateLimiter.evaluate(clientIp, req.method, pathname);
+
+  if (!rateLimitResult.allowed) {
+    const nextScore = increaseScore(clientIp, 1);
+    logEvent(
+      'RateLimited',
+      `${clientIp} exceeded ${req.method} ${pathname} at limit ${rateLimitResult.effectiveLimit} (reputation ${nextScore})`
+    );
+    sendJson(res, 429, {
+      error: 'Too Many Requests',
+      detail: 'Sliding window rate limit exceeded',
+      retryAfterMs: rateLimitResult.retryAfterMs
+    });
+    return;
+  }
+
+  forwardRequest({
+    req,
+    res,
+    bodyBuffer,
+    requestUrl,
+    clientIp
+  });
+}
+
+function processRequest(req, res) {
+  processing += 1;
+
+  let released = false;
+  const release = () => {
+    if (released) {
+      return;
+    }
+
+    released = true;
+    processing = Math.max(0, processing - 1);
+    dequeueNextRequest();
+  };
+
+  res.once('finish', release);
+  res.once('close', release);
+
+  handleRequest(req, res).catch((error) => {
+    logEvent('ProxyError', `${req.method} ${req.url || '/'} failed before proxying: ${error.message}`);
+
+    if (!res.headersSent) {
+      sendJson(res, 500, {
+        error: 'Internal Server Error',
+        detail: 'ProxyArmor failed while processing the request'
+      });
+      return;
+    }
+
+    if (!res.writableEnded) {
+      res.end();
+    }
+  });
 }
 
 function forwardRequest({ req, res, bodyBuffer, requestUrl, clientIp }) {
@@ -227,7 +394,7 @@ const heartbeat = setInterval(() => {
   }
 }, 20000);
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
   setCorsHeaders(res);
 
   if (req.method === 'OPTIONS') {
@@ -250,62 +417,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const clientIp = normalizeClientIp(req.socket.remoteAddress);
-  const pathname = normalizePath(requestUrl.pathname);
-
-  logEvent('Incoming', `${req.method} ${pathname}${requestUrl.search} from ${clientIp}`);
-
-  let bodyBuffer;
-
-  try {
-    bodyBuffer = await readRequestBody(req);
-  } catch (error) {
-    logEvent('Blocked', `${req.method} ${pathname} rejected before proxying: ${error.message}`);
-    sendJson(res, error.statusCode || 400, {
-      error: 'Request Rejected',
-      detail: error.message
-    });
+  if (processing >= MAX_CONCURRENT) {
+    queueRequest(req, res);
     return;
   }
 
-  const bodyText = bodyBuffer.length ? bodyBuffer.toString('utf8') : '';
-
-  const wafResult = waf.inspect({
-    ip: clientIp,
-    pathname,
-    search: requestUrl.search,
-    headers: req.headers,
-    bodyText
-  });
-
-  if (!wafResult.allowed) {
-    logEvent('Blocked', `${wafResult.reason} from ${clientIp} on ${req.method} ${pathname}`);
-    sendJson(res, 403, {
-      error: 'Forbidden',
-      detail: wafResult.reason
-    });
-    return;
-  }
-
-  const rateLimitResult = rateLimiter.evaluate(clientIp, req.method, pathname);
-
-  if (!rateLimitResult.allowed) {
-    logEvent('RateLimited', `${clientIp} exceeded ${req.method} ${pathname}`);
-    sendJson(res, 429, {
-      error: 'Too Many Requests',
-      detail: 'Sliding window rate limit exceeded',
-      retryAfterMs: rateLimitResult.retryAfterMs
-    });
-    return;
-  }
-
-  forwardRequest({
-    req,
-    res,
-    bodyBuffer,
-    requestUrl,
-    clientIp
-  });
+  processRequest(req, res);
 });
 
 server.keepAliveTimeout = 65000;
