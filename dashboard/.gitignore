@@ -1,0 +1,27 @@
+# Binaries and executable files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+__debug_bin
+
+# Dependency directories
+dashboard/node_modules/
+dashboard/build/
+.pnp
+.pnp.js
+
+# Testing and Log files
+results.jtl
+ProxyArmor_Dashboard/
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Local configuration (if you want to keep your local IPs private)
+# config.json
+node_modules
