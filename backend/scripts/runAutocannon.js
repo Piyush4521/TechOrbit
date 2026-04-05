@@ -46,12 +46,14 @@ if (!scenario || !scenarios[scenario]) {
 
 const command = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const commandArgs = ['--yes', ...scenarios[scenario]];
+const spawnOptions = {
+  stdio: 'inherit',
+  shell: process.platform === 'win32'
+};
 
 console.log(`Running: ${command} ${commandArgs.join(' ')}`);
 
-const child = spawn(command, commandArgs, {
-  stdio: 'inherit'
-});
+const child = spawn(command, commandArgs, spawnOptions);
 
 child.on('exit', (code) => {
   process.exit(code || 0);
