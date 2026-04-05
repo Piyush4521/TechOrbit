@@ -15,6 +15,8 @@ Architecture:
 - Uses a sliding window log rate limiter per IP and per endpoint
 - Permanently blacklists IPs after 3 malicious requests in 5 minutes
 - Streams live events to the dashboard over Server-Sent Events at `/events`
+- Supports both judge-friendly snake_case config and internal camelCase config
+- Includes repeatable demo scripts for normal traffic, SQL injection, blacklisting, and load tests
 - Uses only built-in Node.js modules for the gateway path
 
 ## Folder Structure
@@ -31,6 +33,10 @@ proxyarmor-system/
       middleware/
         rateLimiter.js
         waf.js
+    scripts/
+      demoTraffic.js
+      runAutocannon.js
+      updateConfig.js
   frontend/
     src/
       App.jsx
@@ -59,30 +65,37 @@ proxyarmor-system/
 
 ```json
 {
-  "backendUrl": "http://localhost:8080",
-  "rateLimits": [
+  "target": "http://localhost:8080",
+  "rate_limits": [
     {
       "method": "GET",
-      "path": "/getAllUsers",
+      "path": "/users",
       "limit": 100,
-      "windowMs": 60000
+      "window": 60
     },
     {
       "method": "POST",
       "path": "/login",
       "limit": 5,
-      "windowMs": 60000
+      "window": 60
     },
     {
       "method": "*",
       "path": "*",
       "limit": 60,
-      "windowMs": 60000
+      "window": 60
     }
   ],
-  "blacklistedIPs": []
+  "blocked_ips": []
 }
 ```
+
+The loader also accepts the original camelCase form:
+
+- `backendUrl`
+- `rateLimits`
+- `windowMs`
+- `blacklistedIPs`
 
 ## Run Locally
 
@@ -97,7 +110,7 @@ Then open `http://localhost:5173`.
 ## Demo Requests
 
 - Allowed proxy request:
-  `GET http://localhost:9090/getAllUsers`
+  `GET http://localhost:9090/users`
 
 - Rate-limited endpoint:
   `POST http://localhost:9090/login`
@@ -108,9 +121,50 @@ Then open `http://localhost:5173`.
 - SSE dashboard feed:
   `GET http://localhost:9090/events`
 
+## Demo Scripts
+
+From `backend/`:
+
+- Normal traffic:
+  `npm run demo:normal`
+
+- One SQL injection request:
+  `npm run demo:sqli`
+
+- Three attacks plus auto-blacklist verification:
+  `npm run demo:blacklist`
+
+- Tighten `/login` to `2 req/min` without restarting:
+  `npm run demo:config:login:2`
+
+- Restore `/login` to `5 req/min` without restarting:
+  `npm run demo:config:login:5`
+
+- Brute-force style login load with `autocannon`:
+  `npm run demo:perf:login`
+
+- Sustained `/users` load test:
+  `npm run demo:perf:users`
+
+- Exact `5000 request` run for judge-style performance testing:
+  `npm run demo:perf:5000`
+
+The `autocannon` scripts use `npx`, so the first run may download the CLI automatically.
+
 ## Live Config Reload
 
 Edit `backend/config.json` while the proxy is running. ProxyArmor watches the file, reloads the backend URL, rate-limit rules, and blacklist entries, and starts using the new values without a restart.
+
+For the fastest demo:
+
+1. Start `mockBackend.js`
+2. Start `src/proxy.js`
+3. Run `npm run demo:normal`
+4. Run `npm run demo:perf:login`
+5. Run `npm run demo:sqli`
+6. Run `npm run demo:config:login:2`
+7. Re-run `npm run demo:perf:login` without restarting anything
+8. Run `npm run demo:perf:5000`
 
 ## Validation
 
@@ -123,4 +177,6 @@ Backend:
 
 - `node src/proxy.js`
 - `node mockBackend.js`
-- Hit the demo routes above and watch the dashboard feed update in real time
+- `npm run demo:normal`
+- `npm run demo:sqli`
+- `npm run demo:blacklist`

@@ -5,6 +5,10 @@ const { URL } = require('url');
 const configPath = path.join(__dirname, '../config.json');
 const DEFAULT_BACKEND_URL = 'http://localhost:8080';
 
+function hasOwn(source, key) {
+  return Object.prototype.hasOwnProperty.call(source, key);
+}
+
 function normalizePath(value) {
   if (typeof value !== 'string' || !value.trim()) {
     return '/';
@@ -34,7 +38,9 @@ function normalizeRateLimit(rule) {
     : '*';
   const pathPattern = normalizePath(rule.path || '*');
   const limit = Number(rule.limit);
-  const windowMs = Number(rule.windowMs);
+  const windowMs = hasOwn(rule, 'windowMs')
+    ? Number(rule.windowMs)
+    : Number(rule.window) * 1000;
 
   if (!Number.isInteger(limit) || limit <= 0) {
     return null;
@@ -66,18 +72,32 @@ function dedupeStrings(values) {
   );
 }
 
+function usesSnakeCaseConfig(source = {}) {
+  return hasOwn(source, 'target') || hasOwn(source, 'rate_limits') || hasOwn(source, 'blocked_ips');
+}
+
 function normalizeConfig(rawConfig) {
   const source = rawConfig && typeof rawConfig === 'object' ? rawConfig : {};
   const backendUrlValue = source.backendUrl || source.target || DEFAULT_BACKEND_URL;
   const backendUrl = new URL(backendUrlValue).toString().replace(/\/$/, '');
-  const rateLimits = Array.isArray(source.rateLimits)
-    ? source.rateLimits.map(normalizeRateLimit).filter(Boolean)
+  const rawRateLimits = Array.isArray(source.rateLimits)
+    ? source.rateLimits
+    : Array.isArray(source.rate_limits)
+      ? source.rate_limits
+      : [];
+  const rateLimits = rawRateLimits.length
+    ? rawRateLimits.map(normalizeRateLimit).filter(Boolean)
     : [];
+  const rawBlacklistedIPs = Array.isArray(source.blacklistedIPs)
+    ? source.blacklistedIPs
+    : Array.isArray(source.blocked_ips)
+      ? source.blocked_ips
+      : [];
 
   return {
     backendUrl,
     rateLimits,
-    blacklistedIPs: dedupeStrings(source.blacklistedIPs)
+    blacklistedIPs: dedupeStrings(rawBlacklistedIPs)
   };
 }
 
@@ -139,11 +159,14 @@ function createConfigManager({ onLog = () => {} } = {}) {
 
     const raw = fs.readFileSync(configPath, 'utf8');
     const parsed = JSON.parse(raw);
+    const blacklistKey = hasOwn(parsed, 'blocked_ips') || usesSnakeCaseConfig(parsed)
+      ? 'blocked_ips'
+      : 'blacklistedIPs';
     const nextBlacklistedIPs = Array.from(
-      new Set([...(Array.isArray(parsed.blacklistedIPs) ? parsed.blacklistedIPs : []), ip])
+      new Set([...(Array.isArray(parsed[blacklistKey]) ? parsed[blacklistKey] : []), ip])
     );
 
-    parsed.blacklistedIPs = nextBlacklistedIPs;
+    parsed[blacklistKey] = nextBlacklistedIPs;
 
     fs.writeFileSync(configPath, `${JSON.stringify(parsed, null, 2)}\n`, 'utf8');
 

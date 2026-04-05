@@ -1,24 +1,30 @@
 {
-  "backendUrl": "http://localhost:8080",
-  "rateLimits": [
+  "target": "http://localhost:8080",
+  "rate_limits": [
+    {
+      "method": "GET",
+      "path": "/users",
+      "limit": 100,
+      "window": 60
+    },
     {
       "method": "GET",
       "path": "/getAllUsers",
       "limit": 100,
-      "windowMs": 60000
+      "window": 60
     },
     {
       "method": "POST",
       "path": "/login",
       "limit": 5,
-      "windowMs": 60000
+      "window": 60
     },
     {
       "method": "*",
       "path": "*",
       "limit": 60,
-      "windowMs": 60000
+      "window": 60
     }
   ],
-  "blacklistedIPs": []
+  "blocked_ips": []
 }
