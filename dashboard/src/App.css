@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 * {
   margin: 0;
@@ -6,39 +6,97 @@
   box-sizing: border-box;
 }
 
-body {
-  background-color: #0f0f0f;
-  margin: 0;
-  overflow-x: hidden;
+html, body, #root {
+  height: 100%;
+  width: 100%;
 }
 
-/* Custom scrollbar for the elegant look */
+body {
+  background-color: #0f0f0f;
+  color: #fff;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  line-height: 1.6;
+  letter-spacing: 0.5px;
+}
+
+/* Custom scrollbar */
 ::-webkit-scrollbar {
   width: 8px;
+  height: 8px;
 }
+
 ::-webkit-scrollbar-track {
-  background: #121212;
+  background: #0f0f0f;
 }
+
 ::-webkit-scrollbar-thumb {
   background: #333;
   border-radius: 4px;
+  border: 2px solid #0f0f0f;
 }
+
 ::-webkit-scrollbar-thumb:hover {
   background: #444;
 }
 
-.App-logo {
-  height: 40vmin;
-  pointer-events: none;
+/* Smooth transitions */
+button {
+  transition: all 0.2s ease;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  .App-logo {
-    animation: App-logo-spin infinite 20s linear;
+button:hover {
+  opacity: 0.85;
+  transform: translateY(-1px);
+}
+
+button:active {
+  transform: translateY(0);
+}
+
+input[type="text"],
+select {
+  transition: all 0.2s ease;
+}
+
+input[type="text"]:focus,
+select:focus {
+  outline: none;
+  border-color: #61dafb !important;
+  box-shadow: 0 0 8px rgba(97, 218, 251, 0.3);
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
-@keyframes App-logo-spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+@keyframes slideIn {
+  from {
+    transform: translateX(-20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+/* Responsive design */
+@media (max-width: 1400px) {
+  :root {
+    font-size: 15px;
+  }
+}
+
+@media (max-width: 768px) {
+  :root {
+    font-size: 14px;
+  }
 }

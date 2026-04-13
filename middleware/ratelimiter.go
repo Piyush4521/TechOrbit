@@ -2,100 +2,125 @@ package middleware
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
-	"strconv"
-	"sync/atomic"
+	"sync"
 	"time"
 
-	"reverse-proxy/config"
 	"reverse-proxy/streaming"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
-var redisClient *redis.Client
+var (
+	rdb            *redis.Client
+	ctx            = context.Background()
+	redisAvailable = false
 
+	// In-memory rate limiter fallback (when Redis unavailable)
+	inMemoryLimits = &sync.Map{} // map[string]*tokenBucket
+)
+
+type tokenBucket struct {
+	tokens    int64
+	lastReset int64
+	mu        sync.Mutex
+}
+
+// InitRedis connects to your local Redis instance for tracking hits
+// Falls back to in-memory if Redis unavailable
 func InitRedis() {
-	redisClient = redis.NewClient(&redis.Options{
-		Addr:         "localhost:6379",
-		PoolSize:     100,
-		MinIdleConns: 10,
+	rdb = redis.NewClient(&redis.Options{
+		Addr: "127.0.0.1:6379",
 	})
-}
 
-func randomSuffix() string {
-	b := make([]byte, 4)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func isRateLimited(ctx context.Context, ip, path, method string, rule config.RateLimitRule) bool {
-	key := fmt.Sprintf("ratelimit:%s:%s:%s", ip, path, method)
-	now := time.Now().UnixMilli()
-	windowStart := now - int64(rule.WindowSeconds)*1000
-
-	pipe := redisClient.Pipeline()
-
-	pipe.ZRemRangeByScore(ctx, key, "0", strconv.FormatInt(windowStart, 10))
-	countCmd := pipe.ZCard(ctx, key)
-	member := fmt.Sprintf("%d-%s", now, randomSuffix())
-	pipe.ZAdd(ctx, key, &redis.Z{Score: float64(now), Member: member})
-	pipe.Expire(ctx, key, time.Duration(rule.WindowSeconds)*time.Second)
-
-	_, err := pipe.Exec(ctx)
+	// Test connection
+	_, err := rdb.Ping(ctx).Result()
 	if err != nil {
-		log.Printf("[REDIS ERROR] %v\n", err)
-		return false
+		redisAvailable = false
+		fmt.Println("⚠️  Redis unavailable, using in-memory rate limiter")
+	} else {
+		redisAvailable = true
+		fmt.Println("✅ Redis connected successfully")
+	}
+}
+
+// Check rate limit using Redis or in-memory fallback
+func checkRateLimit(ip, path string) (allowed bool, remaining int64) {
+	key := fmt.Sprintf("ratelimit:%s:%s", ip, path)
+	const limit = int64(60)
+	const window = 10 * time.Second
+
+	// Try Redis first
+	if redisAvailable {
+		luaScript := `
+			local key = KEYS[1]
+			local limit = tonumber(ARGV[1])
+			local window = tonumber(ARGV[2])
+			
+			local current = redis.call("INCR", key)
+			if current == 1 then
+				redis.call("EXPIRE", key, window)
+			end
+			return current
+		`
+		count, err := rdb.Eval(ctx, luaScript, []string{key}, limit, 10).Int64()
+		if err == nil {
+			allowed := count <= limit
+			return allowed, limit - count
+		}
 	}
 
-	return countCmd.Val() >= int64(rule.Limit)
+	// Fallback to in-memory rate limiter
+	bucket, _ := inMemoryLimits.LoadOrStore(key, &tokenBucket{
+		tokens:    limit,
+		lastReset: time.Now().Unix(),
+	})
+	tb := bucket.(*tokenBucket)
+
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	now := time.Now().Unix()
+	// Reset tokens if window expired
+	if now-tb.lastReset >= int64(window.Seconds()) {
+		tb.tokens = limit
+		tb.lastReset = now
+	}
+
+	// Check if token available
+	if tb.tokens > 0 {
+		tb.tokens--
+		return true, tb.tokens
+	}
+
+	return false, 0
 }
 
 func RateLimiter(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientIP := extractIP(r)
-		cfg := config.Get()
+		// Specifically targeting the /login path for the hackathon demo
+		if r.URL.Path == "/login" {
+			clientIP := extractIP(r)
+			allowed, remaining := checkRateLimit(clientIP, r.URL.Path)
 
-		var matchedRule *config.RateLimitRule
-		for i, rule := range cfg.RateLimits {
-			if rule.Path == r.URL.Path && rule.Method == r.Method {
-				matchedRule = &cfg.RateLimits[i]
-				break
+			if !allowed {
+				streaming.TrackRequest(clientIP, r.Method, r.URL.Path, "rate_limited", "Rate Limit Exceeded (60/10sec)")
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-RateLimit-Remaining", "0")
+				w.Header().Set("Retry-After", "10")
+				w.WriteHeader(http.StatusTooManyRequests)
+				w.Write([]byte(`{"error":"Too Many Requests","message":"Rate limit exceeded. Max 60 requests per 10 seconds per IP"}`))
+				return
 			}
+
+			// Send rate limit headers
+			w.Header().Set("X-RateLimit-Limit", "60")
+			w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+			w.Header().Set("X-RateLimit-Window", "10s")
 		}
 
-		if matchedRule == nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		if isRateLimited(r.Context(), clientIP, r.URL.Path, r.Method, *matchedRule) {
-			atomic.AddInt64(&streaming.BlockedCount, 1)
-			streaming.Emit(streaming.Event{
-				Type:     "blocked",
-				Decision: "rate_limited",
-				IP:       clientIP,
-				Method:   r.Method,
-				Path:     r.URL.Path,
-				Reason:   "Rate limit exceeded",
-			})
-
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Retry-After", strconv.Itoa(matchedRule.WindowSeconds))
-			w.WriteHeader(http.StatusTooManyRequests)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error":      "Too Many Requests",
-				"retryAfter": strconv.Itoa(matchedRule.WindowSeconds),
-			})
-			log.Printf("[RATE LIMIT] Blocked %s on %s %s\n", clientIP, r.Method, r.URL.Path)
-			return
-		}
-
+		// Proceed to next middleware or proxy if within limits
 		next.ServeHTTP(w, r)
 	})
 }

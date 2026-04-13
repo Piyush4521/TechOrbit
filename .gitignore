@@ -8,3 +8,11 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+*.exe
+*.ps1
+*.rdb
+dump.rdb
+redis/
+test-build
+dummy-backend/backend.exe
+import requests.py
